@@ -1,49 +1,489 @@
-name: Build APK
+package com.ecoagent22;
 
-on:
-  push:
-    branches: ["main"]
-  workflow_dispatch:
+import android.accessibilityservice.AccessibilityService;
+import android.accessibilityservice.AccessibilityServiceInfo;
+import android.view.accessibility.AccessibilityNodeInfo;
+import android.view.accessibility.AccessibilityWindowInfo;
+import android.view.accessibility.AccessibilityEvent;
+import android.view.WindowManager;
+import android.view.Gravity;
+import android.graphics.PixelFormat;
+import android.graphics.Color;
+import android.graphics.drawable.GradientDrawable;
+import android.widget.Button;
+import android.widget.Toast;
+import android.os.Build;
 
-jobs:
-  build:
-    runs-on: ubuntu-latest
+import java.util.*;
+import java.util.regex.*;
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+public class EcoAccessibilityService extends AccessibilityService {
 
-      - name: Set up JDK
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "17"
+    private static final String ECOTRACK_PACKAGE = "com.ecotrackdz.driver_app";
 
-      - name: Extract project ZIP
-        run: |
-          mkdir -p project
-          unzip -q EcoAgent22_ready_to_build*.zip -d project
+    private WindowManager wm;
+    private Button floating;
 
-      - name: Find Gradle wrapper
-        run: |
-          GRADLEW=$(find project -name gradlew -type f | head -n 1)
-          if [ -z "$GRADLEW" ]; then
-            echo "ERROR: gradlew not found inside ZIP"
-            exit 1
-          fi
-          PROJECT_DIR=$(dirname "$GRADLEW")
-          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+    // We remember the last ECOTRACK window that generated an accessibility event.
+    // This avoids losing the target window when the user taps our floating overlay.
+    private int lastEcoWindowId = -1;
 
-      - name: Make gradlew executable
-        run: chmod +x "$PROJECT_DIR/gradlew"
+    @Override
+    public void onServiceConnected() {
+        AccessibilityServiceInfo info = getServiceInfo();
 
-      - name: Build APK
-        run: |
-          cd "$PROJECT_DIR"
-          ./gradlew assembleDebug
+        if (info == null) {
+            info = new AccessibilityServiceInfo();
+        }
 
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: EcoAgent22-APK
-          path: "${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk"
+        info.packageNames = new String[]{ECOTRACK_PACKAGE};
+        info.flags |= AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS;
+        info.flags |= AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS;
+        info.notificationTimeout = 100;
+
+        setServiceInfo(info);
+
+        showButton();
+        toast("Eco Agent متصل.");
+    }
+
+    private void showButton() {
+        if (floating != null) return;
+
+        wm = (WindowManager) getSystemService(WINDOW_SERVICE);
+
+        floating = new Button(this);
+        floating.setText("قراءة\nالطلب");
+        floating.setTextColor(Color.WHITE);
+        floating.setTextSize(14);
+
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(Color.rgb(23, 105, 170));
+        bg.setCornerRadius(80);
+        floating.setBackground(bg);
+
+        floating.setOnClickListener(v -> readOrder());
+
+        WindowManager.LayoutParams p = new WindowManager.LayoutParams(
+                180,
+                110,
+                WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                        | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+                PixelFormat.TRANSLUCENT
+        );
+
+        p.gravity = Gravity.RIGHT | Gravity.CENTER_VERTICAL;
+        p.x = 12;
+        p.y = 0;
+
+        try {
+            wm.addView(floating, p);
+        } catch (Exception e) {
+            toast("تعذر إظهار زر القراءة.");
+        }
+    }
+
+    @Override
+    public void onAccessibilityEvent(AccessibilityEvent event) {
+        if (event == null) return;
+
+        CharSequence pkg = event.getPackageName();
+
+        if (pkg != null && ECOTRACK_PACKAGE.equals(pkg.toString())) {
+            try {
+                lastEcoWindowId = event.getWindowId();
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
+    private void readOrder() {
+        // First show a diagnostic message so we know the button itself is working.
+        toast("تم الضغط على قراءة...");
+
+        AccessibilityNodeInfo root = findEcoRoot();
+
+        if (root == null) {
+            toast("لم أجد نافذة ECOTRACK. افتح الطلب ثم اضغط قراءة مرة أخرى.");
+            return;
+        }
+
+        ArrayList<String> nodes = new ArrayList<>();
+        collect(root, nodes);
+
+        LinkedHashSet<String> unique = new LinkedHashSet<>(nodes);
+        nodes = new ArrayList<>(unique);
+
+        String all = String.join("\n", nodes);
+
+        if (nodes.isEmpty()) {
+            toast("وجدت شاشة ECOTRACK لكن لم أجد نصًا قابلًا للقراءة.");
+            return;
+        }
+
+        Map<String, String> data = extractOrder(nodes, all);
+
+        StringBuilder out = new StringBuilder();
+
+        for (Map.Entry<String, String> entry : data.entrySet()) {
+            if (entry.getValue() != null && !entry.getValue().trim().isEmpty()) {
+                out.append("• ")
+                        .append(entry.getKey())
+                        .append(" : ")
+                        .append(entry.getValue())
+                        .append("\n");
+            }
+        }
+
+        if (out.length() == 0) {
+            out.append("النص الذي سمح ECOTRACK بقراءته:\n")
+                    .append(all);
+        }
+
+        getSharedPreferences("eco", MODE_PRIVATE)
+                .edit()
+                .putString("last_order", out.toString())
+                .putString("phone", data.getOrDefault("الهاتف", ""))
+                .putString(
+                        "city",
+                        data.getOrDefault(
+                                "البلدية",
+                                data.getOrDefault("الولاية", "")
+                        )
+                )
+                .putString("address", data.getOrDefault("العنوان", ""))
+                .apply();
+
+        toast("تمت القراءة: " + nodes.size() + " عنصر.");
+    }
+
+    /**
+     * Find the actual ECOTRACK window.
+     *
+     * The old implementation used only getRootInActiveWindow().
+     * When the user taps the floating accessibility overlay, Android can
+     * make that overlay the active/focused window. In that case the old
+     * method may return null or the wrong root.
+     */
+    private AccessibilityNodeInfo findEcoRoot() {
+
+        // 1) Prefer the last ECOTRACK window received from an accessibility event.
+        if (lastEcoWindowId >= 0) {
+            AccessibilityNodeInfo root = rootFromWindowId(lastEcoWindowId);
+            if (isEcoRoot(root)) {
+                return root;
+            }
+        }
+
+        // 2) Search all interactive windows for ECOTRACK.
+        try {
+            List<AccessibilityWindowInfo> windows = getWindows();
+
+            if (windows != null) {
+
+                // Prefer active/focused ECOTRACK windows.
+                for (AccessibilityWindowInfo window : windows) {
+                    if (window == null) continue;
+
+                    AccessibilityNodeInfo root = window.getRoot();
+                    if (!isEcoRoot(root)) continue;
+
+                    if (window.isActive() || window.isFocused()) {
+                        lastEcoWindowId = window.getId();
+                        return root;
+                    }
+                }
+
+                // Otherwise take any ECOTRACK window.
+                for (AccessibilityWindowInfo window : windows) {
+                    if (window == null) continue;
+
+                    AccessibilityNodeInfo root = window.getRoot();
+                    if (isEcoRoot(root)) {
+                        lastEcoWindowId = window.getId();
+                        return root;
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+        }
+
+        // 3) Final fallback.
+        try {
+            AccessibilityNodeInfo root = getRootInActiveWindow();
+            if (isEcoRoot(root)) {
+                return root;
+            }
+        } catch (Exception ignored) {
+        }
+
+        return null;
+    }
+
+    private AccessibilityNodeInfo rootFromWindowId(int windowId) {
+        try {
+            List<AccessibilityWindowInfo> windows = getWindows();
+
+            if (windows == null) return null;
+
+            for (AccessibilityWindowInfo window : windows) {
+                if (window != null && window.getId() == windowId) {
+                    return window.getRoot();
+                }
+            }
+        } catch (Exception ignored) {
+        }
+
+        return null;
+    }
+
+    private boolean isEcoRoot(AccessibilityNodeInfo root) {
+        if (root == null) return false;
+
+        CharSequence pkg = root.getPackageName();
+
+        return pkg != null
+                && ECOTRACK_PACKAGE.equals(pkg.toString());
+    }
+
+    /**
+     * Collect visible text and accessibility descriptions.
+     * The old version only collected getText(), which can miss important
+     * information exposed through contentDescription.
+     */
+    private void collect(AccessibilityNodeInfo node, ArrayList<String> out) {
+        if (node == null) return;
+
+        addText(out, node.getText());
+        addText(out, node.getContentDescription());
+
+        if (Build.VERSION.SDK_INT >= 26) {
+            addText(out, node.getHintText());
+        }
+
+        if (Build.VERSION.SDK_INT >= 28) {
+            addText(out, node.getTooltipText());
+        }
+
+        for (int i = 0; i < node.getChildCount(); i++) {
+            AccessibilityNodeInfo child = node.getChild(i);
+            if (child != null) {
+                collect(child, out);
+            }
+        }
+    }
+
+    private void addText(ArrayList<String> out, CharSequence value) {
+        if (value == null) return;
+
+        String s = value.toString().trim();
+
+        if (!s.isEmpty()) {
+            out.add(s);
+        }
+    }
+
+    private Map<String, String> extractOrder(
+            ArrayList<String> nodes,
+            String all
+    ) {
+        Map<String, String> m = new LinkedHashMap<>();
+
+        String[] labels = {
+                "المرسل",
+                "رقم التتبع",
+                "رمز الطلبية",
+                "رمز الطلب",
+                "نوع العملية",
+                "المرسل إليه",
+                "الولاية",
+                "البلدية",
+                "العنوان",
+                "الهاتف",
+                "السعر الإجمالي",
+                "التاريخ"
+        };
+
+        for (int i = 0; i < nodes.size(); i++) {
+            String current = nodes.get(i);
+
+            for (String label : labels) {
+                if (current.equals(label) || current.contains(label)) {
+
+                    String value = neighbor(nodes, i, labels);
+
+                    if (value != null && !m.containsKey(label)) {
+                        m.put(label, value);
+                    }
+                }
+            }
+        }
+
+        put(m, "الهاتف", first(all, "0[5-7][0-9]{8}"));
+        put(m, "السعر الإجمالي", after(all, "السعر الإجمالي"));
+        put(m, "رقم التتبع", after(all, "رقم التتبع"));
+
+        if (!m.containsKey("رمز الطلبية")) {
+            put(m, "رمز الطلبية", after(all, "رمز الطلبية"));
+        }
+
+        if (!m.containsKey("رمز الطلب")) {
+            put(m, "رمز الطلب", after(all, "رمز الطلب"));
+        }
+
+        if (!m.containsKey("الولاية")) {
+            put(m, "الولاية", valueNear(nodes, "الولاية"));
+        }
+
+        if (!m.containsKey("البلدية")) {
+            put(m, "البلدية", valueNear(nodes, "البلدية"));
+        }
+
+        if (!m.containsKey("العنوان")) {
+            put(m, "العنوان", valueNear(nodes, "العنوان"));
+        }
+
+        return m;
+    }
+
+    private String neighbor(
+            ArrayList<String> nodes,
+            int index,
+            String[] labels
+    ) {
+        // Try nearby nodes after the label.
+        for (int distance = 1; distance <= 3; distance++) {
+            int j = index + distance;
+
+            if (j < nodes.size()
+                    && validValue(nodes.get(j), labels)) {
+                return nodes.get(j);
+            }
+        }
+
+        // Then try nearby nodes before the label for RTL layouts.
+        for (int distance = 1; distance <= 3; distance++) {
+            int j = index - distance;
+
+            if (j >= 0
+                    && validValue(nodes.get(j), labels)) {
+                return nodes.get(j);
+            }
+        }
+
+        return null;
+    }
+
+    private boolean validValue(
+            String value,
+            String[] labels
+    ) {
+        if (value == null || value.trim().isEmpty()) {
+            return false;
+        }
+
+        for (String label : labels) {
+            if (value.equals(label)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private String valueNear(
+            ArrayList<String> nodes,
+            String label
+    ) {
+        int index = nodes.indexOf(label);
+
+        if (index < 0) return null;
+
+        return neighbor(
+                nodes,
+                index,
+                new String[]{label}
+        );
+    }
+
+    private void put(
+            Map<String, String> map,
+            String key,
+            String value
+    ) {
+        if (!map.containsKey(key)
+                && value != null
+                && !value.trim().isEmpty()) {
+            map.put(key, value.trim());
+        }
+    }
+
+    private String first(
+            String text,
+            String regex
+    ) {
+        if (text == null) return null;
+
+        try {
+            Matcher matcher =
+                    Pattern.compile(regex).matcher(text);
+
+            return matcher.find()
+                    ? matcher.group()
+                    : null;
+
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private String after(
+            String text,
+            String label
+    ) {
+        if (text == null) return null;
+
+        try {
+            Pattern pattern = Pattern.compile(
+                    Pattern.quote(label)
+                            + "\\s*[:：]?\\s*([^\\n]+)"
+            );
+
+            Matcher matcher = pattern.matcher(text);
+
+            return matcher.find()
+                    ? matcher.group(1).trim()
+                    : null;
+
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private void toast(String message) {
+        Toast.makeText(
+                this,
+                message,
+                Toast.LENGTH_SHORT
+        ).show();
+    }
+
+    @Override
+    public void onInterrupt() {
+    }
+
+    @Override
+    public void onDestroy() {
+        if (floating != null && wm != null) {
+            try {
+                wm.removeView(floating);
+            } catch (Exception ignored) {
+            }
+
+            floating = null;
+        }
+
+        super.onDestroy();
+    }
+}
